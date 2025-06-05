@@ -16,6 +16,7 @@ import (
 const (
 	claudeAPIURL = "https://api.anthropic.com/v1/messages"
 	openaiAPIURL = "https://api.openai.com/v1/chat/completions"
+	ollamaAPIURL = "http://localhost:11434/api/generate"
 	version      = "1.0.0"
 )
 
@@ -63,6 +64,18 @@ type OpenAIChoice struct {
 	Message OpenAIMessage `json:"message"`
 }
 
+// Ollama API structs
+type OllamaRequest struct {
+	Model    string `json:"model"`
+	Prompt   string `json:"prompt"`
+	Stream   bool   `json:"stream"`
+}
+
+type OllamaResponse struct {
+	Response string    `json:"response"`
+	Error    *APIError `json:"error,omitempty"`
+}
+
 // Common error struct
 type APIError struct {
 	Type    string `json:"type"`
@@ -74,6 +87,7 @@ type APIProvider int
 const (
 	Claude APIProvider = iota
 	OpenAI
+	Ollama
 )
 
 func main() {
@@ -167,6 +181,8 @@ Examples:
 		response, err = queryClaudeAPI(apiKey, prompt)
 	case OpenAI:
 		response, err = queryOpenAIAPI(apiKey, prompt)
+	case Ollama:
+		response, err = queryOllamaAPI(apiKey, prompt)
 	}
 
 	if err != nil {
@@ -197,11 +213,13 @@ EXAMPLES:
 	llm --explain explain the cp command
 
 SETUP:
-    Set one of the following API keys:
+    Set one of the following environment variables:
     export ANTHROPIC_API_KEY=your_claude_api_key
     export OPENAI_API_KEY=your_openai_api_key
+    export OLLAMA_MODEL=your_ollama_model_name
 
-    The script will automatically detect which API key is available and use the corresponding service.
+    The script will automatically detect which API key or Ollama model is available and use the corresponding service.
+    Priority order: Claude > OpenAI > Ollama
 
 OPTIONS:
     -h, --help     Show this help message
@@ -235,7 +253,12 @@ func determineAPIProvider() (APIProvider, string, error) {
 		return OpenAI, apiKey, nil
 	}
 
-	return Claude, "", fmt.Errorf("no API key found")
+	// Check for Ollama model
+	if model := os.Getenv("OLLAMA_MODEL"); model != "" {
+		return Ollama, model, nil
+	}
+
+	return Claude, "", fmt.Errorf("no API key or Ollama model found")
 }
 
 func queryClaudeAPI(apiKey, prompt string) (string, error) {
@@ -380,6 +403,67 @@ func queryOpenAIAPI(apiKey, prompt string) (string, error) {
 	}
 
 	return command, nil
+}
+
+func queryOllamaAPI(model, prompt string) (string, error) {
+	// Prepare request body
+	reqBody := OllamaRequest{
+		Model:    model,
+		Prompt:   prompt,
+		Stream:   false,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", ollamaAPIURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+
+	// Make the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to make request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %v", err)
+	}
+
+	// Check for HTTP errors
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response
+	var ollamaResp OllamaResponse
+	if err := json.Unmarshal(body, &ollamaResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	// Check for API errors
+	if ollamaResp.Error != nil {
+		return "", fmt.Errorf("API error: %s", ollamaResp.Error.Message)
+	}
+
+	// Extract the command from response
+	if ollamaResp.Response == "" {
+		return "", fmt.Errorf("empty response from API")
+	}
+
+	return strings.TrimSpace(ollamaResp.Response), nil
+
 }
 
 // ANSI escape codes for terminal formatting
