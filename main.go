@@ -8,9 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
+	"regexp"
 )
 
 const (
@@ -128,6 +128,7 @@ func main() {
 	osInfo := runtime.GOOS
 	shell := getShell()
 	prompt := ""
+	renderAsMd := false
 
 	if (codeMode) {
 		prompt = fmt.Sprintf(`You are a code-writing assistant. The user is on %s using %s shell and needs a code snippet.
@@ -144,6 +145,7 @@ User request: %s
 
 Respond with ONLY a very brief, concise description of the concept or solution. The answer should not exceed 2 paragraphs.
 `, osInfo, shell, query)
+		renderAsMd = true
 
 	} else {
 		prompt = fmt.Sprintf(`You are a command-line assistant. The user is on %s using %s shell and needs a command suggestion.
@@ -156,14 +158,15 @@ Examples:
 - For "search for foo in directory" → "grep -R foo ."
 - For "list files by size" → "ls -laSh"
 - For "find large files" → "find . -type f -size +100M"`, osInfo, shell, query)
+		renderAsMd = true
 	}
 
-	var command string
+	var response string
 	switch provider {
 	case Claude:
-		command, err = queryClaudeAPI(apiKey, prompt)
+		response, err = queryClaudeAPI(apiKey, prompt)
 	case OpenAI:
-		command, err = queryOpenAIAPI(apiKey, prompt)
+		response, err = queryOpenAIAPI(apiKey, prompt)
 	}
 
 	if err != nil {
@@ -171,7 +174,11 @@ Examples:
 		os.Exit(1)
 	}
 
-	fmt.Println(command)
+	if renderAsMd {
+		fmt.Println(RenderMarkdown(response))
+	} else {
+		fmt.Println(response)
+	}
 }
 
 func printUsage() {
@@ -223,49 +230,12 @@ func determineAPIProvider() (APIProvider, string, error) {
 		return Claude, apiKey, nil
 	}
 
-	// Try to get Claude API key from pass
-	if claudeKey, err := getAnthropicAPIKey(""); err == nil && claudeKey != "" {
-		return Claude, claudeKey, nil
-	}
-
 	// Check for OpenAI API key
 	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
 		return OpenAI, apiKey, nil
 	}
 
 	return Claude, "", fmt.Errorf("no API key found")
-}
-
-// GetAnthropicAPIKey attempts to get the Anthropic API key from environment variable
-// or falls back to using the `pass` program with the specified key name
-func getAnthropicAPIKey(passKeyName string) (string, error) {
-    // Try environment variable first
-    apiKey := os.Getenv("ANTHROPIC_API_KEY")
-    if apiKey != "" {
-        return apiKey, nil
-    }
-    
-    // Check if `pass` program is available
-    _, err := exec.LookPath("pass")
-    if err != nil {
-        return "", err
-    }
-    
-    // Determine pass key name (default to "anthropic.com")
-    keyName := "anthropic.com"
-    if len(passKeyName) > 0 {
-        keyName = passKeyName
-    }
-    
-    // Execute `pass show <keyName>`
-    cmd := exec.Command("pass", "show", keyName)
-    output, err := cmd.Output()
-    if err != nil {
-        return "", err
-    }
-    
-    // Return the trimmed output (removes trailing newlines)
-    return strings.TrimSpace(string(output)), nil
 }
 
 func queryClaudeAPI(apiKey, prompt string) (string, error) {
@@ -410,4 +380,95 @@ func queryOpenAIAPI(apiKey, prompt string) (string, error) {
 	}
 
 	return command, nil
+}
+
+// ANSI escape codes for terminal formatting
+const (
+	Reset     = "\033[0m"
+	Bold      = "\033[1m"
+	Italic    = "\033[3m"
+	Underline = "\033[4m"
+	Red       = "\033[31m"
+	Green     = "\033[32m"
+	Yellow    = "\033[33m"
+	Blue      = "\033[34m"
+	Magenta   = "\033[35m"
+	Cyan      = "\033[36m"
+)
+
+// RenderMarkdown converts basic markdown to terminal-formatted text
+func RenderMarkdown(markdown string) string {
+	lines := strings.Split(markdown, "\n")
+	var result strings.Builder
+
+	for _, line := range lines {
+		rendered := renderLine(line)
+		result.WriteString(rendered + "\n")
+	}
+
+	return strings.TrimSuffix(result.String(), "\n")
+}
+
+func renderLine(line string) string {
+	// Handle headers
+	if strings.HasPrefix(line, "### ") {
+		return Yellow + Bold + strings.TrimPrefix(line, "### ") + Reset
+	}
+	if strings.HasPrefix(line, "## ") {
+		return Blue + Bold + strings.TrimPrefix(line, "## ") + Reset
+	}
+	if strings.HasPrefix(line, "# ") {
+		return Magenta + Bold + strings.TrimPrefix(line, "# ") + Reset
+	}
+
+	// Handle code blocks (simple single-line detection)
+	if strings.HasPrefix(line, "```") {
+		return Cyan + line + Reset
+	}
+
+	// Handle bullet points
+	if strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
+		return Green + "• " + Reset + strings.TrimPrefix(strings.TrimPrefix(line, "- "), "* ")
+	}
+
+	// Handle numbered lists
+	if matched, _ := regexp.MatchString(`^\d+\. `, line); matched {
+		re := regexp.MustCompile(`^(\d+\. )(.*)`)
+		matches := re.FindStringSubmatch(line)
+		if len(matches) == 3 {
+			return Yellow + matches[1] + Reset + matches[2]
+		}
+	}
+
+	// Handle inline formatting
+	line = renderInlineFormatting(line)
+
+	return line
+}
+
+func renderInlineFormatting(text string) string {
+	// Process bold first (**text** and __text__) to avoid conflicts with italic
+	boldRe := regexp.MustCompile(`\*\*([^\*\n]*?)\*\*`)
+	text = boldRe.ReplaceAllString(text, Bold+"$1"+Reset)
+
+	boldRe2 := regexp.MustCompile(`__([^_\n]*?)__`)
+	text = boldRe2.ReplaceAllString(text, Bold+"$1"+Reset)
+
+	// Then process italic (*text* and _text_)
+	// Use non-greedy matching and allow whitespace
+	italicRe := regexp.MustCompile(`\*([^\*\n]*?)\*`)
+	text = italicRe.ReplaceAllString(text, Italic+"$1"+Reset)
+
+	italicRe2 := regexp.MustCompile(`_([^_\n]*?)_`)
+	text = italicRe2.ReplaceAllString(text, Italic+"$1"+Reset)
+
+	// Inline code (`code`) - preserve whitespace
+	codeRe := regexp.MustCompile("`([^`\n]*?)`")
+	text = codeRe.ReplaceAllString(text, Cyan+"$1"+Reset)
+
+	// Links [text](url) - preserve whitespace
+	linkRe := regexp.MustCompile(`\[([^\]\n]*?)\]\([^)\n]*?\)`)
+	text = linkRe.ReplaceAllString(text, Blue+Underline+"$1"+Reset)
+
+	return text
 }
