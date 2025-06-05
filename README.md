@@ -1,13 +1,13 @@
 # `llm-cli`
 
-A simple command-line tool that uses AI (Claude or OpenAI) to suggest shell commands, generate code snippets, or explain programming concepts based on natural language descriptions.
+A simple command-line tool that uses AI (Claude, OpenAI, or Ollama) to suggest shell commands, generate code snippets, or explain programming concepts based on natural language descriptions.
 
 ## Features
 
 - **Command suggestions**: Get shell commands from natural language descriptions
 - **Code gen**: Generate code snippets with the `--code` flag
 - **Explanations**: Get brief explanations of commands/concepts with the `--explain` flag
-- **Multi-API support**: Works with both Anthropic Claude and OpenAI GPT models
+- **Multi-API support**: Works with Anthropic Claude, OpenAI GPT models, and local Ollama models
 
 ## Installation
 
@@ -15,14 +15,15 @@ Install Go, run `make install`.
 
 ## Setup
 
-Set one of the following API keys:
+Set one of the following environment variables:
 
 ```bash
 export ANTHROPIC_API_KEY=your_claude_api_key
 export OPENAI_API_KEY=your_openai_api_key
+export OLLAMA_MODEL=your_ollama_model_name
 ```
 
-The tool will automatically use whichever key is available (Claude takes priority if both are set).
+The tool will automatically use whichever key or model is available (Claude takes priority if multiple are set).
 
 ## Usage
 
@@ -83,6 +84,7 @@ The find command searches for files and directories...
 
 - **Claude**: `claude-sonnet-4-20250514`
 - **OpenAI**: `gpt-4o-mini`
+- **Ollama**: Any locally installed model (e.g., llama2, mistral, codellama)
 
 ## License
 
