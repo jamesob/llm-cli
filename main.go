@@ -8,16 +8,21 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"regexp"
+	"time"
 )
 
 const (
-	claudeAPIURL = "https://api.anthropic.com/v1/messages"
-	openaiAPIURL = "https://api.openai.com/v1/chat/completions"
-	ollamaAPIURL = "http://localhost:11434/api/generate"
-	version      = "1.0.0"
+	claudeAPIURL       = "https://api.anthropic.com/v1/messages"
+	openaiAPIURL       = "https://api.openai.com/v1/chat/completions"
+	ollamaAPIURL       = "http://localhost:11434/api/generate"
+	defaultClaudeModel = "claude-sonnet-5-5"
+	defaultLocalURL    = "http://rainman.j.co:30000/v1"
+	defaultLocalModel  = "Qwen3.8-27B"
+	version            = "1.0.0"
 )
 
 // Claude API structs
@@ -87,39 +92,54 @@ type APIProvider int
 const (
 	Claude APIProvider = iota
 	OpenAI
+	Local
 	Ollama
 )
 
+// How to authenticate against the Claude API.
+type claudeAuthKind int
+
+const (
+	authAPIKey claudeAuthKind = iota // x-api-key header
+	authBearer                       // ANTHROPIC_AUTH_TOKEN: Authorization: Bearer
+	authOAuth                        // ant profile token: Bearer + oauth beta header
+)
+
+type providerConfig struct {
+	provider   APIProvider
+	apiKey     string
+	model      string
+	baseURL    string // Local provider only
+	claudeAuth claudeAuthKind
+}
+
 func main() {
+	start := time.Now()
+
 	if len(os.Args) < 2 {
 		printUsage()
-		os.Exit(1)
-	}
-
-	// Determine which API to use
-	provider, apiKey, err := determineAPIProvider()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Set one of the following environment variables:\n")
-		fmt.Fprintf(os.Stderr, "  export ANTHROPIC_API_KEY=your_claude_api_key\n")
-		fmt.Fprintf(os.Stderr, "  export OPENAI_API_KEY=your_openai_api_key\n")
 		os.Exit(1)
 	}
 
 	// Define flags
 	var codeMode bool
 	var explainMode bool
-	
+	var backend string
+	var localMode bool
+
 	// Custom flag set to handle both short and long flags
 	flagSet := flag.NewFlagSet("llm", flag.ExitOnError)
 	flagSet.BoolVar(&codeMode, "code", false, "Code generation mode")
 	flagSet.BoolVar(&codeMode, "c", false, "Code generation mode (short)")
 	flagSet.BoolVar(&explainMode, "explain", false, "Explanation mode")
 	flagSet.BoolVar(&explainMode, "x", false, "Explanation mode (short)")
-	
+	flagSet.StringVar(&backend, "backend", "", "Force a specific backend: claude, openai, local, or ollama")
+	flagSet.StringVar(&backend, "b", "", "Force a specific backend (short)")
+	flagSet.BoolVar(&localMode, "local", false, "Use the local backend (shorthand for -b local)")
+
 	// Custom usage function
 	flagSet.Usage = printUsage
-	
+
 	// Handle help and version flags
 	if os.Args[1] == "--help" || os.Args[1] == "-h" {
 		printUsage()
@@ -131,12 +151,33 @@ func main() {
 	}
 
 	// Parse flags and get remaining arguments
-	err = flagSet.Parse(os.Args[1:])
-	if err != nil {
+	if err := flagSet.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
 	}
-	
+
 	query := strings.Join(flagSet.Args(), " ")
+
+	if localMode && backend != "" {
+		fmt.Fprintf(os.Stderr, "Error: cannot use both --local and -b/--backend\n")
+		os.Exit(1)
+	}
+	if localMode {
+		backend = "local"
+	}
+
+	// Determine which API to use
+	cfg, err := determineProvider(backend)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if backend == "" {
+			fmt.Fprintf(os.Stderr, "Log in with `ant auth login`, or set one of the following environment variables:\n")
+			fmt.Fprintf(os.Stderr, "  export ANTHROPIC_API_KEY=your_claude_api_key\n")
+			fmt.Fprintf(os.Stderr, "  export OPENAI_API_KEY=your_openai_api_key\n")
+			fmt.Fprintf(os.Stderr, "  export LLM_MODEL=your_local_model_name\n")
+			fmt.Fprintf(os.Stderr, "  export OLLAMA_MODEL=your_ollama_model_name\n")
+		}
+		os.Exit(1)
+	}
 
 	// Get system context
 	osInfo := runtime.GOOS
@@ -176,13 +217,15 @@ Examples:
 	}
 
 	var response string
-	switch provider {
+	switch cfg.provider {
 	case Claude:
-		response, err = queryClaudeAPI(apiKey, prompt)
+		response, err = queryClaudeAPI(cfg, prompt)
 	case OpenAI:
-		response, err = queryOpenAIAPI(apiKey, prompt)
+		response, err = queryOpenAIAPI(cfg.apiKey, prompt)
+	case Local:
+		response, err = queryLocalAPI(cfg, prompt)
 	case Ollama:
-		response, err = queryOllamaAPI(apiKey, prompt)
+		response, err = queryOllamaAPI(cfg.model, prompt)
 	}
 
 	if err != nil {
@@ -194,6 +237,11 @@ Examples:
 		fmt.Println(RenderMarkdown(response))
 	} else {
 		fmt.Println(response)
+	}
+
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		fmt.Fprintf(os.Stderr, "%s%.2fs%s\n", Dim, elapsed.Seconds(), Reset)
 	}
 }
 
@@ -213,20 +261,33 @@ EXAMPLES:
 	llm --explain explain the cp command
 
 SETUP:
-    Set one of the following environment variables:
+    Log in with the Anthropic CLI (preferred; no static key to manage):
+    ant auth login
+
+    Or set one of the following environment variables:
     export ANTHROPIC_API_KEY=your_claude_api_key
     export OPENAI_API_KEY=your_openai_api_key
+    export LLM_MODEL=your_local_model_name
     export OLLAMA_MODEL=your_ollama_model_name
 
-    The script will automatically detect which API key or Ollama model is available and use the corresponding service.
-    Priority order: Claude > OpenAI > Ollama
+    The script will automatically detect which credential or model is available and use the corresponding service.
+    Priority order: Claude > OpenAI > Local > Ollama
+    Claude credentials resolve as: logged-in ant profile > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY
+
+    The Local provider talks to any OpenAI-compatible server (defaults to
+    rainman.j.co). Optional overrides:
+    export LLM_BASE_URL=http://rainman.j.co:30000/v1
+    export LLM_API_KEY=your_key
+    export CLAUDE_MODEL=claude-sonnet-5-5
 
 OPTIONS:
+    -b, --backend  Force a specific backend: claude, openai, local, or ollama
+    --local        Use the local backend (shorthand for -b local)
     -h, --help     Show this help message
     -v, --version  Show version information
     -c, --code     Code generation mode
     -x, --explain  Explanation mode
-`, version)
+ `, version)
 }
 
 func getShell() string {
@@ -242,29 +303,98 @@ func getShell() string {
 	return parts[len(parts)-1]
 }
 
-func determineAPIProvider() (APIProvider, string, error) {
-	// Check for Claude API key first
-	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
-		return Claude, apiKey, nil
+func determineProvider(backend string) (providerConfig, error) {
+	// Explicit backend selection
+	if backend != "" {
+		return backendProvider(backend)
 	}
 
-	// Check for OpenAI API key
-	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
-		return OpenAI, apiKey, nil
+	// Auto-detect in priority order: Claude > OpenAI > Local > Ollama.
+	// Claude is available via a logged-in ant profile or env credentials.
+	if cfg, err := backendProvider("claude"); err == nil {
+		return cfg, nil
+	}
+	if os.Getenv("OPENAI_API_KEY") != "" {
+		return backendProvider("openai")
+	}
+	if os.Getenv("LLM_BASE_URL") != "" || os.Getenv("LLM_MODEL") != "" {
+		return backendProvider("local")
+	}
+	if os.Getenv("OLLAMA_MODEL") != "" {
+		return backendProvider("ollama")
 	}
 
-	// Check for Ollama model
-	if model := os.Getenv("OLLAMA_MODEL"); model != "" {
-		return Ollama, model, nil
-	}
-
-	return Claude, "", fmt.Errorf("no API key or Ollama model found")
+	return providerConfig{}, fmt.Errorf("no API key or model found")
 }
 
-func queryClaudeAPI(apiKey, prompt string) (string, error) {
+func backendProvider(backend string) (providerConfig, error) {
+	switch backend {
+	case "claude":
+		model := os.Getenv("CLAUDE_MODEL")
+		if model == "" {
+			model = defaultClaudeModel
+		}
+		// Prefer a logged-in session (ant auth login) over static keys.
+		if token := claudeSessionToken(); token != "" {
+			return providerConfig{provider: Claude, apiKey: token, model: model,
+				claudeAuth: authOAuth}, nil
+		}
+		if token := os.Getenv("ANTHROPIC_AUTH_TOKEN"); token != "" {
+			return providerConfig{provider: Claude, apiKey: token, model: model,
+				claudeAuth: authBearer}, nil
+		}
+		if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
+			return providerConfig{provider: Claude, apiKey: apiKey, model: model}, nil
+		}
+		return providerConfig{}, fmt.Errorf(
+			"claude backend requires a logged-in session (ant auth login), " +
+				"ANTHROPIC_AUTH_TOKEN, or ANTHROPIC_API_KEY")
+	case "openai":
+		apiKey := os.Getenv("OPENAI_API_KEY")
+		if apiKey == "" {
+			return providerConfig{}, fmt.Errorf("openai backend requires OPENAI_API_KEY")
+		}
+		return providerConfig{provider: OpenAI, apiKey: apiKey, model: "gpt-4o-mini"}, nil
+	case "local", "rainman":
+		baseURL := os.Getenv("LLM_BASE_URL")
+		if baseURL == "" {
+			baseURL = defaultLocalURL
+		}
+		model := os.Getenv("LLM_MODEL")
+		if model == "" {
+			model = defaultLocalModel
+		}
+		return providerConfig{provider: Local, apiKey: os.Getenv("LLM_API_KEY"), model: model, baseURL: baseURL}, nil
+	case "ollama":
+		model := os.Getenv("OLLAMA_MODEL")
+		if model == "" {
+			return providerConfig{}, fmt.Errorf("ollama backend requires OLLAMA_MODEL")
+		}
+		return providerConfig{provider: Ollama, model: model}, nil
+	}
+	return providerConfig{}, fmt.Errorf("unknown backend %q (expected claude, openai, local, or ollama)", backend)
+}
+
+// claudeSessionToken returns a short-lived OAuth access token from a logged-in
+// `ant auth login` profile, or "" when the ant CLI or an active profile isn't
+// available. print-credentials refreshes an expired token itself, so calling
+// it once per invocation is sufficient.
+func claudeSessionToken() string {
+	antPath, err := exec.LookPath("ant")
+	if err != nil {
+		return ""
+	}
+	out, err := exec.Command(antPath, "auth", "print-credentials", "--access-token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func queryClaudeAPI(cfg providerConfig, prompt string) (string, error) {
 	// Prepare request body
 	reqBody := ClaudeRequest{
-		Model:     "claude-sonnet-4-20250514",
+		Model:     cfg.model,
 		MaxTokens: 1000,
 		Messages: []Message{
 			{
@@ -285,10 +415,19 @@ func queryClaudeAPI(apiKey, prompt string) (string, error) {
 		return "", fmt.Errorf("failed to create request: %v", err)
 	}
 
-	// Set headers
+	// Set headers. OAuth tokens use Authorization: Bearer (plus a beta header
+	// the API requires for OAuth on /v1/messages); API keys use x-api-key.
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	switch cfg.claudeAuth {
+	case authOAuth:
+		req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
+		req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	case authBearer:
+		req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
+	default:
+		req.Header.Set("x-api-key", cfg.apiKey)
+	}
 
 	// Make the request
 	client := &http.Client{}
@@ -320,23 +459,36 @@ func queryClaudeAPI(apiKey, prompt string) (string, error) {
 		return "", fmt.Errorf("API error: %s", claudeResp.Error.Message)
 	}
 
-	// Extract the command from response
-	if len(claudeResp.Content) == 0 {
-		return "", fmt.Errorf("no content in response")
+	// Extract the text from response, skipping thinking blocks (which
+	// appear first on models with adaptive thinking)
+	var text strings.Builder
+	for _, block := range claudeResp.Content {
+		if block.Type == "text" {
+			text.WriteString(block.Text)
+		}
 	}
 
-	command := strings.TrimSpace(claudeResp.Content[0].Text)
+	command := strings.TrimSpace(text.String())
 	if command == "" {
-		return "", fmt.Errorf("empty response from API")
+		return "", fmt.Errorf("no text in response")
 	}
 
 	return command, nil
 }
 
 func queryOpenAIAPI(apiKey, prompt string) (string, error) {
+	return queryOpenAICompat(openaiAPIURL, apiKey, "gpt-4o-mini", prompt)
+}
+
+func queryLocalAPI(cfg providerConfig, prompt string) (string, error) {
+	url := strings.TrimRight(cfg.baseURL, "/") + "/chat/completions"
+	return queryOpenAICompat(url, cfg.apiKey, cfg.model, prompt)
+}
+
+func queryOpenAICompat(url, apiKey, model, prompt string) (string, error) {
 	// Prepare request body
 	reqBody := OpenAIRequest{
-		Model:       "gpt-4o-mini",
+		Model:       model,
 		MaxTokens:   1000,
 		Temperature: 0.1,
 		Messages: []OpenAIMessage{
@@ -353,14 +505,16 @@ func queryOpenAIAPI(apiKey, prompt string) (string, error) {
 	}
 
 	// Create HTTP request
-	req, err := http.NewRequest("POST", openaiAPIURL, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %v", err)
 	}
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 
 	// Make the request
 	client := &http.Client{}
@@ -470,6 +624,7 @@ func queryOllamaAPI(model, prompt string) (string, error) {
 const (
 	Reset     = "\033[0m"
 	Bold      = "\033[1m"
+	Dim       = "\033[2m"
 	Italic    = "\033[3m"
 	Underline = "\033[4m"
 	Red       = "\033[31m"
